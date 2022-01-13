@@ -1,200 +1,175 @@
 from typing import Tuple
-
+import re
 import os
-import json
 import functools
 
 import torch
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset, Subset, dataloader, dataset
 
 
 import pytorch_lightning as pl
-import torchmetrics
 
 import numpy as np
 import matplotlib.pyplot as plt
 
 from tqdm import tqdm
 
-import multiprocessing
-
-
-def get_keypoint_index(keypoint: str) -> int:
-    keypoints = ['Nose', 'Neck', 'RShoulder', 'RElbow', 'RWrist', 'LShoulder', 'LElbow', 'LWrist',
-                 'RHip', 'RKnee', 'RAnkle', 'LHip', 'LKnee', 'LAnkle', 'REye', 'LEye', 'REar', 'LEar']
-    return keypoints.index(keypoint)
-
-
-def read_frame_file(file_path: str) -> np.ndarray:
-    # print(file_path)
-    with open(file_path, 'r') as file:
-        data = json.loads(file.read())
-    frame = np.array(data['people'][0]['pose_keypoints_2d']).reshape((18, 3))
-    # frame.shape: [(keypoints_num), (x, y, confidence)]
-    return frame[:, :2]
-
-
-def normalize_frame(frame: np.ndarray) -> np.ndarray:
-    i_neck = get_keypoint_index('Neck')
-    i_rhip = get_keypoint_index('RHip')
-    i_lhip = get_keypoint_index('LHip')
-
-    kp_neck = np.array([frame[i_neck, 0], frame[i_neck, 1]])
-    kp_rhip = np.array([frame[i_rhip, 0], frame[i_rhip, 1]])
-    kp_lhip = np.array([frame[i_lhip, 0], frame[i_lhip, 1]])
-    kp_mhip = (kp_rhip + kp_lhip) / 2
-    kp_center = (kp_neck + kp_mhip) / 2
-    scale = np.linalg.norm(kp_center - kp_mhip)
-    return (frame - kp_center) / scale  # align center and scale
-
-
-def read_sequence_dir(dir_path: str) -> np.ndarray:
-    sequence = []
-    for file_name in os.listdir(dir_path):
-        file_path = os.path.join(dir_path, file_name)
-        frame = read_frame_file(file_path)
-        frame = normalize_frame(frame)
-        sequence.append(frame)
-    # sequence.shape: [(sequence_num), (keypoints_num), (x, y)]
-    return np.array(sequence)
-
 
 @functools.lru_cache(maxsize=6666)
-def read_subject_dir(subject_dir: str) -> np.ndarray:
-    subject_id = int(os.path.basename(subject_dir))
-
-    cache_dir = os.path.join(subject_dir, '..', '_cache')
-    cache_npy = os.path.join(cache_dir, f'{subject_id}.npy')
+def load_bvh_from_file(file_path: str) -> np.ndarray:
+    cache_dir = os.path.join(os.path.dirname(file_path), '_cache')
+    cache_npy = os.path.join(cache_dir, f'{os.path.basename(file_path)}.npy')
 
     if os.path.exists(cache_npy):
         return np.load(cache_npy, allow_pickle=True)
     elif not os.path.exists(cache_dir):
         os.makedirs(cache_dir)
 
-    sequences = []
-    for sequence_dir in os.listdir(subject_dir):
-        camera_angle, sequence_no = sequence_dir.split('_')
-        camera_angle, sequence_no = int(camera_angle), int(sequence_no)
-        sequence_dir_path = os.path.join(subject_dir, sequence_dir)
-        sequence = read_sequence_dir(sequence_dir_path)
-        sequences.append((subject_id, camera_angle, sequence_no, sequence))
-    sequences = np.array(sequences, dtype=object)
+    with open(file_path, 'r') as file:
+        bvh = file.read()
 
-    cache_npy = os.path.join(
-        cache_dir, f'{subject_id}_{sequences.shape[0]}.npy')
-    np.save(cache_npy, sequences)
-    # np_sequences.shape: [sequence_num, (subject_id, camera_angle, sequence_no, sequence)]
-    return sequences
+    # 骨架信息 [93]
+    skeleton = list(map(float, ' '.join(re.findall(
+        r'OFFSET\s(.*?)\n\s*CHANNELS', bvh)).split(' ')))
+    skeleton = np.array(skeleton, dtype=np.float32)
+
+    # 运动帧信息 [96, 240]
+    bvh = bvh[bvh.find('Frame Time'):]
+    bvh = bvh[bvh.find('\n') + 1:]
+    bvh = bvh.strip()
+    # [240, 96]
+    sequence = list(map(lambda f: [float(x)
+                                   for x in f.split(' ')], bvh.split('\n')))
+    sequence = np.array(sequence, dtype=np.float32)
+
+    # 身份标签 ID
+    label = int(os.path.basename(
+        file_path).split('_')[0])  # 文件名第一个数字作为标签
+
+    sample = np.array([skeleton, sequence, label], dtype=object)
+    np.save(cache_npy, sample)
+    return sample
 
 
-class OU_MVLP_POSE_Dataset(Dataset):
-    def __init__(self, data_root: str = './dataset/OU-MVLP-POSE/alphapose'):
-        # there should be 10307 subject folders in the data_root folder
+def save_bvh_to_file(file_path: str, skeleton: np.ndarray, sequence: np.ndarray, frame_time: float = 0.025):
+    # skeleton.shape: [93]
+    # sequence.shape: [n, 96]
 
-        cache_npy = os.path.join(
-            data_root, '_cache', '_subject_sequence_num.npy')
-        if os.path.exists(cache_npy):
-            subject_sequences_num = np.load(cache_npy)
-        else:
-            subject_dirs = sorted([f for f in os.listdir(data_root)
-                                   if not f.startswith('_')])
+    with open('dataset/CMU/template.bvh', 'r') as f:
+        bvh_template = f.read()
 
-            subject_sequences_num = []
-            for subject_dir in subject_dirs:
-                print(subject_dir)
-                sequences = read_subject_dir(
-                    os.path.join(data_root, subject_dir))
-                print(sequences.shape)
-                subject_sequences_num.append(sequences.shape[0])
-            subject_sequences_num = np.array(subject_sequences_num)
-            np.save(cache_npy, subject_sequences_num)
-        # subject_sequence_num: [subject_1_num, subject_2_num, ...]
+    split_index = bvh_template.find('MOTION')
+    bvh_hierarchy = bvh_template[:split_index]
+    bvh_motion = bvh_template[split_index:]
 
-        subject_sequences_range = [0]
-        for x in subject_sequences_num:
-            subject_sequences_range.append(subject_sequences_range[-1] + x)
-        # subject_sequences_range: [0, subject_1_num, subject_1_num + subject_2_num, ...]
-        subject_sequences_range = np.array(subject_sequences_range)
-        self.subject_sequences_range = subject_sequences_range
+    bvh_hierarchy = bvh_hierarchy.format(*skeleton.tolist())
 
+    n, _ = sequence.shape
+    motion_data = '\n'.join([' '.join(['{:.6f}'.format(x) for x in frame])
+                             for frame in sequence])
+    bvh_motion = bvh_motion.format(n, frame_time, motion_data)
+
+    output_dir = os.path.join(os.path.dirname(file_path))
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    with open(file_path, 'w') as f:
+        f.write('\n'.join([bvh_hierarchy, bvh_motion]))
+
+
+class CMU_Dataset(Dataset):
+    def __init__(self, data_root: str = './dataset/CMU/walk'):
+        self.sequence_file_path = sorted([os.path.join(data_root, f) for f in os.listdir(data_root)
+                                          if not f.startswith('_')])
         self.data_root = data_root
 
     def __len__(self) -> int:
-        return self.subject_sequences_range[-1]
+        return len(self.sequence_file_path)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
+    def __getitem__(self, idx: int) -> Tuple[np.ndarray, np.ndarray, int]:
         if idx < 0 or idx >= self.__len__():
             raise IndexError
 
-        subject_id = np.searchsorted(
-            self.subject_sequences_range, idx, side='right')
-        seq_local_index = idx - self.subject_sequences_range[subject_id - 1]
+        sample = load_bvh_from_file(self.sequence_file_path[idx])
+        skeleton, sequence, label = sample
 
-        subject_dir = os.path.join(self.data_root, f'{subject_id:05d}')
-        sequences = read_subject_dir(subject_dir)
-        subject_id, camera_angle, sequence_no, sequence = sequences[seq_local_index]
-        return sequence, subject_id, camera_angle, sequence_no
-
-
-def collate_fn(random_clip: bool = False):
-    def _collate_fn(samples: list) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # samples: [(sequence, subject_id, camera_angle, sequence_no), ...]
-        # sequence.shape: [sequence_num, (keypoints_num), (x, y)]
-
-        # find the min sequence length
-        min_sequence_num = min([x[0].shape[0] for x in samples])
-
-        # all sequences should have the same length
-        sequences = [torch.tensor(x[0], dtype=torch.float32)
-                     for x in samples]  # ragged
-        for i, s in enumerate(sequences):
-            # s: [sequence_num, (keypoints_num), (x, y)]
-            n = s.shape[0]
-
-            startIndex = 0
-            if random_clip and n > min_sequence_num:
-                startIndex = np.random.randint(0, n - min_sequence_num)
-
-            endIndex = startIndex + min_sequence_num
-            sequences[i] = s[startIndex:endIndex]
+        # transform
+        sequence = sequence[::3, 3:]  # 下采样帧率、去除根节点绝对位置
 
         return (
-            torch.stack(sequences),  # clip sequence
-            torch.stack([torch.tensor(x[1], dtype=torch.float32)
-                        for x in samples]),  # subject_id
-            torch.stack([torch.tensor(x[2], dtype=torch.float32)
-                        for x in samples]),  # camera_angle
-            torch.stack([torch.tensor(x[3], dtype=torch.float32)
-                        for x in samples]),  # sequence_no
+            skeleton,
+            sequence,
+            label,
+        )
+
+
+def collate_fn(
+    random_clip: bool = False,
+    min_clip_ratio: float = 0.05,  # 样本最小被裁剪到百分之几
+    amplify_factor: float = 1,  # 样本扩增期望数量
+):
+    def _collate_fn(samples: list) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # samples: [(skeleton, sequence, label), ...]
+        # sequence.shape: [sequence_num, keypoints_num]
+
+        seq_length = len(samples[0][1])
+        clip_length = seq_length
+        if random_clip:
+            clip_length = np.random.randint(
+                seq_length*min_clip_ratio, seq_length+1)
+
+        # 随机裁剪数据、扩增样本
+
+        skeletons = []
+        sequences = []
+        labels = []
+
+        for skeleton, sequence, label in samples:
+            # sequence: [sequence_num, keypoints_x_y_z_num]
+            t = 1
+            if amplify_factor > 1:
+                t = int((amplify_factor**0.5)*np.random.randn() +
+                        amplify_factor)  # 正态分布样本扩增
+            for _ in range(t):
+                start_index = 0
+                if random_clip and seq_length-clip_length > 0:
+                    start_index = np.random.randint(
+                        0, seq_length - clip_length)
+                end_index = start_index + clip_length
+
+                skeletons.append(torch.tensor(skeleton, dtype=torch.float32))
+                sequences.append(torch.tensor(
+                    sequence[start_index:end_index], dtype=torch.float32))
+                labels.append(torch.tensor(label, dtype=torch.int32))
+
+        return (
+            torch.stack(skeletons),
+            torch.stack(sequences),
+            torch.stack(labels),
         )
     return _collate_fn
 
 
-class OU_MVLP_POSE_DataModule(pl.LightningDataModule):
-    def __init__(self, batch_size: int = 64):
+class CMU_DataModule(pl.LightningDataModule):
+    def __init__(self, batch_size: int = 32):
         super().__init__()
         self.batch_size = batch_size
-        self.num_workers = 0
-        # self.num_workers = multiprocessing.cpu_count()
 
     def prepare_data(self) -> None:
-        dataset = OU_MVLP_POSE_Dataset()
-
-        split_index = [0, 3607, 5153, 10307]
-        split_seq_index = [dataset.subject_sequences_range[x]
-                           for x in split_index]
+        dataset = CMU_Dataset()
 
         self.train = Subset(
             dataset=dataset,
-            indices=range(split_seq_index[0], split_seq_index[1])
+            indices=range(0, 96)
         )
         self.val = Subset(
             dataset=dataset,
-            indices=range(split_seq_index[1], split_seq_index[2])
+            indices=range(96, 154)
         )
         self.test = Subset(
             dataset=dataset,
-            indices=range(split_seq_index[2], split_seq_index[3])
+            # indices=range(154, 161)
+            indices=range(114, 161)
         )
 
     def train_dataloader(self) -> 'torch.utils.data.Dataloader':
@@ -202,8 +177,8 @@ class OU_MVLP_POSE_DataModule(pl.LightningDataModule):
             dataset=self.train,
             batch_size=self.batch_size,
             shuffle=True,
-            collate_fn=collate_fn(random_clip=True),
-            num_workers=self.num_workers
+            collate_fn=collate_fn(
+                random_clip=True, min_clip_ratio=0.05, amplify_factor=3),
         )
 
     def val_dataloader(self) -> 'torch.utils.data.Dataloader':
@@ -211,8 +186,7 @@ class OU_MVLP_POSE_DataModule(pl.LightningDataModule):
             dataset=self.val,
             batch_size=self.batch_size,
             shuffle=False,
-            num_workers=self.num_workers,
-            collate_fn=collate_fn(random_clip=False)
+            collate_fn=collate_fn(random_clip=False, amplify_factor=3),
         )
 
     def test_dataloader(self) -> 'torch.utils.data.Dataloader':
@@ -220,82 +194,17 @@ class OU_MVLP_POSE_DataModule(pl.LightningDataModule):
             dataset=self.test,
             batch_size=self.batch_size,
             shuffle=False,
-            num_workers=self.num_workers,
-            collate_fn=collate_fn(random_clip=False)
+            collate_fn=collate_fn(random_clip=False, amplify_factor=1),
         )
 
 
-# with torch.no_grad():
-#     model = Transformer(dim=128, depth=3, heads=6,
-#                         dim_head=64, mlp_dim=256, dropout=0.1)
-#     x = torch.randn(1, 15, 128)  # [b, n, c]
-#     y = model(x)
-#     print(y.shape)
-
-# root = './dataset/OU-MVLP-POSE/alphapose/_cache'
-# for x in os.listdir(root):
-#     if x.startswith('_'):
-#         continue
-#     arr = x.split('_')
-#     oldname = x
-#     newname = f'{arr[0]}.npy'
-#     os.rename(os.path.join(root, oldname), os.path.join(root, newname))
-#     print(newname)
-
-
 if __name__ == '__main__':
-    datamodule = OU_MVLP_POSE_DataModule()
+    datamodule = CMU_DataModule()
     datamodule.prepare_data()
     train_loader = datamodule.train_dataloader()
 
     for epoch in range(10):
         for batch in tqdm(train_loader):
-            sequence, subject_id, camera_angle, sequence_no = batch
-            continue
-
-    # d = OU_MVLP_POSE_Dataset()
-    # s = Subset(d, range(0, 100000))
-    # dl = DataLoader(s, batch_size=64, shuffle=True, num_workers=0)
-
-    # for epoch in range(10):
-    #     for batch in tqdm(dl):
-    #         pass
-
-    # dataset = OU_MVLP_POSE_Dataset()
-
-    # print(len(dataset))
-    # s = dataset[len(dataset)-1]
-
-    # sequences = read_subject_dir(os.path.join(DATA_ROOT, '00001'))
-    # sequence = sequences[0][3]
-    # frame = sequence[0]
-
-    # print(sequences.shape)
-    # print(sequence.shape)
-    # print(frame.shape)
-
-    # fig = plt.figure()
-    # ax = fig.add_subplot()
-    # ax.set_aspect('equal')
-    # ax.invert_yaxis()
-
-    # aligned = align_center(frame)
-    # scatter = ax.scatter(aligned[:, 0], aligned[:, 1], c='gray')
-
-    # plt.show()
-
-    # sequence = read_sequence_dir(os.path.join(
-    #     './dataset/OU-MVLP-POSE/alphapose', '03607', '000_00'))
-    # print(sequence.shape)
-
-    # fig = plt.figure()
-    # ax = fig.add_subplot()
-    # ax.set_aspect('equal')
-    # ax.invert_yaxis()
-
-    # for frame in sequence:
-    #     scatter = ax.scatter(frame[:, 0], frame[:, 1], c='gray')
-
-    # plt.savefig('test.png')
-
-    # exit()
+            skeleton, sequence, label = batch
+            print(skeleton.shape, sequence.shape, label.shape)
+            exit()

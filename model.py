@@ -1,5 +1,6 @@
 from typing import Tuple
 
+import itertools
 import functools
 
 import numpy as np
@@ -10,13 +11,11 @@ from torch import nn
 import pytorch_lightning as pl
 
 from einops import rearrange, repeat
-from einops.layers.torch import Rearrange
-from torch._C import device
 
 from circle_loss import convert_label_to_similarity, CircleLoss
 
+from dataset import save_bvh_to_file
 
-# helpers
 
 @functools.lru_cache(maxsize=16)
 def get_sinusoid_encoding_table(n_position, d_hid, device: str = 'cpu'):
@@ -38,8 +37,6 @@ def gen_mask(n: int, mask_ratio: float = 0.2, device: str = 'cpu') -> torch.Tens
     # False: masked, True: unmasked
     return mask  # [n]
 
-
-# classes
 
 class PreNorm(nn.Module):
     def __init__(self, dim, fn):
@@ -119,14 +116,10 @@ class Encoder(pl.LightningModule):
     def __init__(self, patch_dim, feature_dim, dim, depth, heads, mlp_dim, dim_head=64, dropout=0., emb_dropout=0.):
         super().__init__()
 
-        self.proj = nn.Linear(patch_dim, dim)
-
-        # self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
-        # precompute position embedding table
         self.pos_embedding = get_sinusoid_encoding_table(128, dim)
-
         self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
-        # self.dropout = nn.Dropout(emb_dropout)
+
+        self.proj = nn.Linear(patch_dim, dim)
 
         self.transformer = Transformer(
             dim, depth, heads, dim_head, mlp_dim, dropout)
@@ -163,7 +156,6 @@ class Encoder(pl.LightningModule):
 
         x = torch.cat((cls_tokens, x), dim=1)
 
-        # x = self.dropout(x)
         x = self.transformer(x)
 
         feature = self.mlp_head(x[:, 0])
@@ -176,33 +168,34 @@ class Decoder(pl.LightningModule):
     def __init__(self, patch_dim, dim, depth, heads, mlp_dim, dim_head=64, dropout=0.):
         super().__init__()
 
-        # self.placeholder = nn.Parameter(torch.randn(1, 1, dim))
-        self.placeholder = nn.Parameter(torch.zeros(1, 1, dim))
-
-        # precompute position embedding table
         self.pos_embedding = get_sinusoid_encoding_table(128, dim)
+        self.placeholder = nn.Parameter(torch.zeros(1, 1, dim))
 
         self.transformer = Transformer(
             dim, depth, heads, dim_head, mlp_dim, dropout)
 
         self.proj = nn.Linear(dim, patch_dim)
 
-    def forward(self, x, mask: torch.Tensor = None) -> torch.Tensor:
-        # x.shape: [b, n, dim]
+    def forward(self, feature, embedding, mask: torch.Tensor = None) -> torch.Tensor:
+        # feature.shape: [b, dim]
+        # embedding.shape: [b, n, dim]
 
         if self.device != self.pos_embedding.device:  # hotfix
             self.pos_embedding = self.pos_embedding.to(self.device)
 
+        x = embedding
         if mask is not None:
             # recovery masked embedding
-            b, n, d = x.shape[0], mask.shape[0], x.shape[2]
+            b, n, d = embedding.shape[0], mask.shape[0], embedding.shape[2]
             recovery_x = repeat(self.placeholder, '() () d -> b n d', b=b, n=n)
-            recovery_x += self.pos_embedding[:, 1:(n + 1), :]
+            # recovery_x += torch.randn_like(recovery_x)  # 噪声
             x = recovery_x.masked_scatter(
-                repeat(mask, 'n -> b n d', b=b, n=n, d=d), x)
+                repeat(mask, 'n -> b n d', b=b, n=n, d=d), embedding)
+            x += self.pos_embedding[:, 1:(n + 1), :]  # 全部重加位置编码
 
-        x = self.transformer(x)
-        x = self.proj(x)
+        feature = rearrange(feature, 'b d -> b 1 d')
+        x = self.transformer(torch.cat([feature, x], dim=1))
+        x = self.proj(x[:, 1:, :])
         return x
 
 
@@ -211,7 +204,7 @@ class MaskGait(pl.LightningModule):
         super().__init__()
 
         self.encoder = Encoder(
-            patch_dim=18*2,
+            patch_dim=93,
             feature_dim=256,
             dim=256,
             depth=4,
@@ -222,7 +215,7 @@ class MaskGait(pl.LightningModule):
         )
 
         self.decoder = Decoder(
-            patch_dim=18*2,
+            patch_dim=93,
             dim=256,
             depth=3,
             heads=8,
@@ -232,56 +225,100 @@ class MaskGait(pl.LightningModule):
         self.cricle_loss = CircleLoss(m=0.25, gamma=80)
         self.mse_loss = nn.MSELoss()
 
-    def forward(self, x, mask: torch.Tensor = None):
-        feature, embedding = self.encoder(x, mask)
-        reconstruction = self.decoder(embedding, mask)
-        return feature, reconstruction
+        self.pos_embedding = get_sinusoid_encoding_table(128, 93)
 
-    def training_step(self, batch, batch_idx):
-        sequence, subject_id, camera_angle, sequence_no = batch
+    def forward(self, input_seq, mask: torch.Tensor = None):
+        feature, embedding = self.encoder(input_seq, mask)
+        recon_seq = self.decoder(feature, embedding, mask)
+        return feature, recon_seq
 
-        b, n, _, _ = sequence.shape
-        sequence = sequence.reshape(b, n, -1)  # [b, n, 18*2]
+    def training_step(self, batch, batch_idx, optimizer_idx):
+        skeleton, sequence, label = batch
 
-        mask_ratio = 0.2
-        mask = gen_mask(n, mask_ratio, device=self.device)
+        input_seq = sequence[:, :-1, :]
+        target_seq = sequence[:, 1:, :]
 
-        feature, reconstruction = self.forward(sequence, mask)
+        if optimizer_idx == 0:  # 训练自编码器
+            b, n, c = input_seq.shape
 
-        loss_cls = self.cricle_loss(
-            *convert_label_to_similarity(feature, subject_id))
-        loss_recon = self.mse_loss(reconstruction, sequence)
-        loss = loss_cls + loss_recon
+            mask = gen_mask(n, mask_ratio=0.618, device=self.device)
 
-        self.log_dict({'train/loss_cls': loss_cls,
-                      'train/loss_recon': loss_recon, 'train/loss': loss})
-        return loss
+            feature, embedding = self.encoder(input_seq, mask)
+            recon_seq = self.decoder(feature, embedding, mask)
+
+            loss_cls = self.cricle_loss(
+                *convert_label_to_similarity(feature, label))
+            loss_recon = self.mse_loss(recon_seq, target_seq)
+
+            # loss_recon = self.mse_loss(recon_seq, target_seq)
+            loss = loss_cls + loss_recon
+
+            self.log_dict({'train/loss_cls': loss_cls,
+                          'train/loss_recon': loss_recon})
+
+            return loss
+
+        if optimizer_idx == 1:  # 训练解码器，让它生成的序列与原始序列feature相似度更高
+            feature, embedding = self.encoder(input_seq)
+            recon_seq = self.decoder(feature, embedding)
+            recon_feature, _ = self.encoder(recon_seq)
+
+            loss_recon_cls = self.cricle_loss(
+                *convert_label_to_similarity(torch.cat([feature, recon_feature]), torch.cat([label, label])))
+            loss = loss_recon_cls
+
+            self.log_dict({'train/loss_recon_cls': loss_recon_cls})
+
+            return loss
 
     def validation_step(self, batch, batch_idx):
-        sequence, subject_id, camera_angle, sequence_no = batch
+        skeleton, sequence, label = batch
 
-        b, n, _, _ = sequence.shape
-        sequence = sequence.reshape(b, n, -1)  # [b, n, 18*2]
+        input_seq = sequence[:, :-1, :]
+        target_seq = sequence[:, 1:, :]
 
-        # mask_ratio = 0
-        # mask = gen_mask(n, mask_ratio, device=self.device)
+        feature, embedding = self.encoder(input_seq)
+        recon_seq = self.decoder(feature, embedding)
 
-        feature, reconstruction = self.forward(sequence)
+        recon_feature, _ = self.encoder(recon_seq)
 
         loss_cls = self.cricle_loss(
-            *convert_label_to_similarity(feature, subject_id))
-        loss_recon = self.mse_loss(reconstruction, sequence)
+            *convert_label_to_similarity(torch.cat([feature, recon_feature]), torch.cat([label, label])))
+        loss_recon = self.mse_loss(recon_seq, target_seq)
         loss = loss_cls + loss_recon
 
         self.log_dict({'val/loss_cls': loss_cls,
-                      'val/loss_recon': loss_recon, 'val/loss': loss})
+                       'val/loss_recon': loss_recon,
+                       'val/loss': loss})
+
+        # if self.trainer.logger_connector.should_update_logs:
+        i = 0
+        np_label = label[i].cpu().numpy()
+        np_skeleton = skeleton[i].detach().cpu().numpy()
+        np_recon_seq = recon_seq[i].detach().cpu().numpy()
+        n, _ = np_recon_seq.shape
+        np_recon_seq = np.concatenate(  # 设置根节点xyz为0
+            [np.zeros([n, 3], dtype=np.float32), np_recon_seq], axis=1)
+
+        save_bvh_to_file(
+            'tb_logs/output/recon_{}_{}_{}.bvh'.format(self.current_epoch, np_label, n), np_skeleton, np_recon_seq, frame_time=0.025)
+
+        self.logger.experiment.add_embedding(
+            feature, metadata=label, global_step=self.global_step)
         return loss
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=0.001)
+        opt_ae = torch.optim.Adam(
+            itertools.chain(self.encoder.parameters(),
+                            self.decoder.parameters()),
+            lr=1e-3)
+        opt_decoder = torch.optim.Adam(self.decoder.parameters(), lr=1e-3)
+        return [opt_ae, opt_decoder], []
 
 
 if __name__ == '__main__':
     model = MaskGait()
-    x = torch.randn(6, 14, 36)
-    model(x)
+
+    x = torch.randn(6, 80, 93)
+    feature, reconstruction = model(x)
+    print(feature.shape, reconstruction.shape)
