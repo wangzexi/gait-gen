@@ -105,7 +105,7 @@ class CMU_Dataset(Dataset):
 
 def collate_fn(
     random_clip: bool = False,
-    min_clip_ratio: float = 0.05,  # 样本最小被裁剪到百分之几
+    min_clip_ratio: float = 0.618,  # 样本最小被裁剪到百分之几
     amplify_factor: float = 1,  # 样本扩增期望数量
 ):
     def _collate_fn(samples: list) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -165,6 +165,7 @@ class CMU_DataModule(pl.LightningDataModule):
         self.val = Subset(
             dataset=dataset,
             indices=range(96, 154)
+            # indices=range(0, 161)
         )
         self.test = Subset(
             dataset=dataset,
@@ -178,13 +179,13 @@ class CMU_DataModule(pl.LightningDataModule):
             batch_size=self.batch_size,
             shuffle=True,
             collate_fn=collate_fn(
-                random_clip=True, min_clip_ratio=0.05, amplify_factor=3),
+                random_clip=True, min_clip_ratio=0.618, amplify_factor=3),
         )
 
     def val_dataloader(self) -> 'torch.utils.data.Dataloader':
         return DataLoader(
             dataset=self.val,
-            batch_size=self.batch_size,
+            batch_size=self.batch_size*999,
             shuffle=False,
             collate_fn=collate_fn(random_clip=False, amplify_factor=3),
         )
@@ -192,7 +193,7 @@ class CMU_DataModule(pl.LightningDataModule):
     def test_dataloader(self) -> 'torch.utils.data.Dataloader':
         return DataLoader(
             dataset=self.test,
-            batch_size=self.batch_size,
+            batch_size=self.batch_size*999,
             shuffle=False,
             collate_fn=collate_fn(random_clip=False, amplify_factor=1),
         )

@@ -8,7 +8,7 @@ trainer = pl.Trainer(
     logger=pl.loggers.TensorBoardLogger(save_dir='tb_logs', name='MaskGait'),
     max_epochs=5000,
     log_every_n_steps=50,
-    # val_check_interval=1,
+    # val_check_interval=6,
     # limit_val_batches=0.5
 
     callbacks=[pl.callbacks.ModelCheckpoint(
@@ -21,7 +21,7 @@ trainer = pl.Trainer(
 
 
 model = MaskGait()
-data_module = CMU_DataModule(batch_size=32)
+data_module = CMU_DataModule(batch_size=16)
 
 trainer.fit(
     model=model,

@@ -183,15 +183,24 @@ class Decoder(pl.LightningModule):
         if self.device != self.pos_embedding.device:  # hotfix
             self.pos_embedding = self.pos_embedding.to(self.device)
 
-        x = embedding
-        if mask is not None:
-            # recovery masked embedding
+        # x = embedding
+        # if mask is not None:
+        #     # recovery masked embedding
+        #     b, n, d = embedding.shape[0], mask.shape[0], embedding.shape[2]
+        #     recovery_x = repeat(self.placeholder, '() () d -> b n d', b=b, n=n)
+        #     # recovery_x += torch.randn_like(recovery_x)  # 噪声
+        #     x = recovery_x.masked_scatter(
+        #         repeat(mask, 'n -> b n d', b=b, n=n, d=d), embedding)
+        #     x += self.pos_embedding[:, 1:(n + 1), :]  # 全部重加位置编码
+
+        # embedding仅提供形状
+        if mask is None:
+            b, n, d = embedding.shape[0], embedding.shape[1], embedding.shape[2]
+        else:
             b, n, d = embedding.shape[0], mask.shape[0], embedding.shape[2]
-            recovery_x = repeat(self.placeholder, '() () d -> b n d', b=b, n=n)
-            # recovery_x += torch.randn_like(recovery_x)  # 噪声
-            x = recovery_x.masked_scatter(
-                repeat(mask, 'n -> b n d', b=b, n=n, d=d), embedding)
-            x += self.pos_embedding[:, 1:(n + 1), :]  # 全部重加位置编码
+
+        x = repeat(self.placeholder, '() () d -> b n d', b=b, n=n)
+        x += self.pos_embedding[:, 1:(n + 1), :]  # 加位置编码
 
         feature = rearrange(feature, 'b d -> b 1 d')
         x = self.transformer(torch.cat([feature, x], dim=1))
@@ -235,13 +244,13 @@ class MaskGait(pl.LightningModule):
     def training_step(self, batch, batch_idx, optimizer_idx):
         skeleton, sequence, label = batch
 
-        input_seq = sequence[:, :-1, :]
-        target_seq = sequence[:, 1:, :]
+        input_seq = sequence[:, :, :]
+        target_seq = sequence[:, :, :]
 
         if optimizer_idx == 0:  # 训练自编码器
             b, n, c = input_seq.shape
 
-            mask = gen_mask(n, mask_ratio=0.618, device=self.device)
+            mask = gen_mask(n, mask_ratio=0.8, device=self.device)
 
             feature, embedding = self.encoder(input_seq, mask)
             recon_seq = self.decoder(feature, embedding, mask)
@@ -250,7 +259,6 @@ class MaskGait(pl.LightningModule):
                 *convert_label_to_similarity(feature, label))
             loss_recon = self.mse_loss(recon_seq, target_seq)
 
-            # loss_recon = self.mse_loss(recon_seq, target_seq)
             loss = loss_cls + loss_recon
 
             self.log_dict({'train/loss_cls': loss_cls,
@@ -274,8 +282,8 @@ class MaskGait(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         skeleton, sequence, label = batch
 
-        input_seq = sequence[:, :-1, :]
-        target_seq = sequence[:, 1:, :]
+        input_seq = sequence[:, :, :]
+        target_seq = sequence[:, :, :]
 
         feature, embedding = self.encoder(input_seq)
         recon_seq = self.decoder(feature, embedding)
@@ -292,7 +300,7 @@ class MaskGait(pl.LightningModule):
                        'val/loss': loss})
 
         # if self.trainer.logger_connector.should_update_logs:
-        i = 0
+        i = np.random.randint(0, len(label))
         np_label = label[i].cpu().numpy()
         np_skeleton = skeleton[i].detach().cpu().numpy()
         np_recon_seq = recon_seq[i].detach().cpu().numpy()
