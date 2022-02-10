@@ -7,7 +7,7 @@ trainer = pl.Trainer(
     gpus=1,
     logger=pl.loggers.TensorBoardLogger(save_dir='tb_logs', name='MaskGait'),
     max_epochs=5000,
-    log_every_n_steps=50,
+    # log_every_n_steps=50,
     # val_check_interval=6,
     # limit_val_batches=0.5
 

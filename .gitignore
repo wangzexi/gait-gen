@@ -1,7 +1,8 @@
 __pycache__
 .vscode
 
-dataset/CMU/walk/_cache
+_cache
+
 dataset/MNIST
 dataset/OU-MVLP-POSE
 

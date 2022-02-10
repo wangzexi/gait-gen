@@ -4,7 +4,7 @@ import os
 import functools
 
 import torch
-from torch.utils.data import DataLoader, Dataset, Subset, dataloader, dataset
+from torch.utils.data import DataLoader, Dataset, Subset, ConcatDataset, random_split
 
 
 import pytorch_lightning as pl
@@ -78,10 +78,11 @@ def save_bvh_to_file(file_path: str, skeleton: np.ndarray, sequence: np.ndarray,
 
 
 class CMU_Dataset(Dataset):
-    def __init__(self, data_root: str = './dataset/CMU/walk'):
+    def __init__(self, data_root: str = './dataset/CMU/walk', motion_label: int = 0):
         self.sequence_file_path = sorted([os.path.join(data_root, f) for f in os.listdir(data_root)
                                           if not f.startswith('_')])
         self.data_root = data_root
+        self.motion_label = motion_label
 
     def __len__(self) -> int:
         return len(self.sequence_file_path)
@@ -92,6 +93,7 @@ class CMU_Dataset(Dataset):
 
         sample = load_bvh_from_file(self.sequence_file_path[idx])
         skeleton, sequence, label = sample
+        motion_label = self.motion_label
 
         # transform
         sequence = sequence[::3, 3:]  # 下采样帧率、去除根节点绝对位置
@@ -100,6 +102,7 @@ class CMU_Dataset(Dataset):
             skeleton,
             sequence,
             label,
+            motion_label
         )
 
 
@@ -123,8 +126,9 @@ def collate_fn(
         skeletons = []
         sequences = []
         labels = []
+        motion_labels = []
 
-        for skeleton, sequence, label in samples:
+        for skeleton, sequence, label, motion_label in samples:
             # sequence: [sequence_num, keypoints_x_y_z_num]
             t = 1
             if amplify_factor > 1:
@@ -141,11 +145,14 @@ def collate_fn(
                 sequences.append(torch.tensor(
                     sequence[start_index:end_index], dtype=torch.float32))
                 labels.append(torch.tensor(label, dtype=torch.int32))
+                motion_labels.append(torch.tensor(
+                    motion_label, dtype=torch.int32))
 
         return (
             torch.stack(skeletons),
             torch.stack(sequences),
             torch.stack(labels),
+            torch.stack(motion_labels)
         )
     return _collate_fn
 
@@ -156,22 +163,25 @@ class CMU_DataModule(pl.LightningDataModule):
         self.batch_size = batch_size
 
     def prepare_data(self) -> None:
-        dataset = CMU_Dataset()
+        train_dataset = ConcatDataset([
+            CMU_Dataset(data_root='./dataset/CMU/train/walk', motion_label=0),
+            CMU_Dataset(data_root='./dataset/CMU/train/run', motion_label=1),
+            CMU_Dataset(data_root='./dataset/CMU/train/jump', motion_label=2),
+        ])
 
-        self.train = Subset(
-            dataset=dataset,
-            indices=range(0, 96)
-        )
-        self.val = Subset(
-            dataset=dataset,
-            indices=range(96, 154)
-            # indices=range(0, 161)
-        )
-        self.test = Subset(
-            dataset=dataset,
-            # indices=range(154, 161)
-            indices=range(114, 161)
-        )
+        test_dataset = ConcatDataset([
+            CMU_Dataset(data_root='./dataset/CMU/test/walk', motion_label=0),
+            CMU_Dataset(data_root='./dataset/CMU/test/run', motion_label=1),
+            CMU_Dataset(data_root='./dataset/CMU/test/jump', motion_label=2),
+        ])
+
+        # 训练集:验证集 = 8:2
+        train_length = int(len(train_dataset) * 0.8)
+        val_length = len(train_dataset) - train_length
+        self.train, self.val = random_split(
+            train_dataset, [train_length, val_length])
+
+        self.test = test_dataset
 
     def train_dataloader(self) -> 'torch.utils.data.Dataloader':
         return DataLoader(
@@ -206,6 +216,7 @@ if __name__ == '__main__':
 
     for epoch in range(10):
         for batch in tqdm(train_loader):
-            skeleton, sequence, label = batch
-            print(skeleton.shape, sequence.shape, label.shape)
+            skeleton, sequence, label, motion_label = batch
+            print(skeleton.shape, sequence.shape,
+                  label.shape, motion_label.shape)
             exit()
