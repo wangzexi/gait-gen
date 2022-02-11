@@ -113,7 +113,7 @@ class Transformer(nn.Module):
 
 
 class Encoder(pl.LightningModule):
-    def __init__(self, patch_dim, feature_identify_dim, feature_motion_dim, dim, depth, heads, mlp_dim, dim_head=64, dropout=0., emb_dropout=0.):
+    def __init__(self, patch_dim, feature_identify_dim, feature_motion_dim, z_dim, dim, depth, heads, mlp_dim, dim_head=64, dropout=0., emb_dropout=0.):
         super().__init__()
 
         self.pos_embedding = get_sinusoid_encoding_table(128, dim)
@@ -131,6 +131,9 @@ class Encoder(pl.LightningModule):
 
         self.feature_identify_dim = feature_identify_dim
         self.feature_motion_dim = feature_motion_dim
+
+        self.fc_mu = nn.Linear(feature_identify_dim, z_dim)
+        self.fc_logvar = nn.Linear(feature_identify_dim, z_dim)
 
     def forward(self, x, mask: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
         # x.shape: [b, n, patch_dim]
@@ -167,19 +170,23 @@ class Encoder(pl.LightningModule):
 
         embedding = x[:, 1:]
 
+        # vae
+        mu = self.fc_mu(feature_identify)
+        logvar = self.fc_logvar(feature_identify)
+
         # [b, feature_dim], [b, n, dim]
-        return feature_identify, feature_motion, embedding
+        return (feature_identify, feature_motion), (mu, logvar),  embedding
 
 
 class Decoder(pl.LightningModule):
-    def __init__(self, feature_identify_dim, feature_motion_dim, patch_dim, dim, depth, heads, mlp_dim, dim_head=64, dropout=0.):
+    def __init__(self, feature_identify_dim, feature_motion_dim, z_dim, patch_dim, dim, depth, heads, mlp_dim, dim_head=64, dropout=0.):
         super().__init__()
 
         self.pos_embedding = get_sinusoid_encoding_table(128, dim)
         self.placeholder = nn.Parameter(torch.zeros(1, 1, dim))
 
         self.feature_proj = nn.Linear(
-            feature_identify_dim + feature_motion_dim, dim)
+            z_dim + feature_motion_dim, dim)
 
         self.transformer = Transformer(
             dim, depth, heads, dim_head, mlp_dim, dropout)
@@ -188,8 +195,10 @@ class Decoder(pl.LightningModule):
 
         self.out_proj = nn.Linear(dim, patch_dim)
 
-    def forward(self, feature_identify, feature_motion, seq_len: int) -> torch.Tensor:
-        # feature.shape: [b, dim]
+    def forward(self, feature_identify, feature_motion, z, seq_len: int) -> torch.Tensor:
+        # feature_identify.shape: [b, feature_identify_dim]
+        # feature_motion.shape: [b, feature_motion_dim]
+        # z.shape: [b, z_dim]
         # seq_len: 生成序列长度
 
         if self.device != self.pos_embedding.device:  # hotfix
@@ -200,7 +209,7 @@ class Decoder(pl.LightningModule):
         placeholder = repeat(self.placeholder, '() () d -> b n d', b=b, n=n)
         placeholder += self.pos_embedding[:, 1:(n + 1), :]  # 加位置编码
 
-        feature = torch.cat((feature_identify, feature_motion), dim=1)
+        feature = torch.cat((z, feature_motion), dim=1)
         feature = rearrange(self.feature_proj(feature), 'b d -> b 1 d')
 
         x = self.transformer(torch.cat([feature, placeholder], dim=1))
@@ -216,6 +225,7 @@ class MaskGait(pl.LightningModule):
             patch_dim=93,
             feature_identify_dim=64,
             feature_motion_dim=64,
+            z_dim=64,
             dim=256,
             depth=4,
             heads=8,
@@ -227,6 +237,7 @@ class MaskGait(pl.LightningModule):
         self.decoder = Decoder(
             feature_identify_dim=64,
             feature_motion_dim=64,
+            z_dim=64,
             patch_dim=93,
             dim=256,
             depth=3,
@@ -238,10 +249,19 @@ class MaskGait(pl.LightningModule):
         self.circle_loss_motion = CircleLoss(m=0.25, gamma=80)
         self.mse_loss = nn.MSELoss()
 
+        def kld_loss(mu, logvar):
+            return -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        self.kld_loss = kld_loss
+
         self.pos_embedding = get_sinusoid_encoding_table(128, 93)
 
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return eps * std + mu
+
     def forward(self, input_seq, mask: torch.Tensor = None):
-        fi, fm, embedding = self.encoder(input_seq, mask)
+        (fi, fm), (mu, logvar), embedding = self.encoder(input_seq, mask)
         recon_seq = self.decoder(fi, fm, seq_len=embedding.shape[1])
         return fi, fm, recon_seq
 
@@ -253,35 +273,39 @@ class MaskGait(pl.LightningModule):
 
         b, n, c = input_seq.shape
 
-        if optimizer_idx == 0:  # 训练自编码器
+        if optimizer_idx == 0:  # 训练编码器
 
             mask = gen_mask(n, mask_ratio=0.8, device=self.device)
 
-            feature_identify, feature_motion, embedding = self.encoder(
+            (feature_identify, feature_motion), (mu, logvar), embedding = self.encoder(
                 input_seq, mask)
+            z = self.reparameterize(mu, logvar)
             recon_seq = self.decoder(
-                feature_identify, feature_motion, seq_len=n)
+                feature_identify, feature_motion, z, seq_len=n)
 
             loss_cls_identify = self.circle_loss_identify(
                 *convert_label_to_similarity(feature_identify, label))
+            loss_identify_kld = self.kld_loss(mu, logvar)
+
             loss_cls_motion = self.circle_loss_motion(
                 *convert_label_to_similarity(feature_motion, motion_label))
 
             loss_recon = self.mse_loss(recon_seq, target_seq)
 
-            loss = loss_cls_identify + loss_cls_motion + loss_recon
+            loss = loss_cls_identify + loss_identify_kld + loss_cls_motion + loss_recon
 
             self.log_dict({'train/loss_cls_identify': loss_cls_identify,
                            'train/loss_cls_motion': loss_cls_motion,
                           'train/loss_recon': loss_recon})
             return loss
 
-        if optimizer_idx == 1:  # 训练解码器，让它生成的序列与原始序列feature相似度更高
-            feature_identify, feature_motion, embedding = self.encoder(
+        if optimizer_idx == 1:  # 训练解码器，让生成的序列与原始序列feature相似度更高
+            (feature_identify, feature_motion), (mu, logvar), embedding = self.encoder(
                 input_seq)
+            z = self.reparameterize(mu, logvar)
             recon_seq = self.decoder(
-                feature_identify, feature_motion, seq_len=n)
-            recon_feature_identify, recon_feature_motion, _ = self.encoder(
+                feature_identify, feature_motion, z, seq_len=n)
+            (recon_feature_identify, recon_feature_motion), (mu, logvar), _ = self.encoder(
                 recon_seq)
 
             loss_recon_cls_identify = self.circle_loss_identify(
@@ -304,11 +328,14 @@ class MaskGait(pl.LightningModule):
 
         b, n, c = input_seq.shape
 
-        feature_identify, feature_motion, embedding = self.encoder(input_seq)
+        (feature_identify, feature_motion), (mean,
+                                             logvar), embedding = self.encoder(input_seq)
+        # z = self.reparameterize(mean, logvar)
+        z = torch.randn_like(mean)
         recon_seq = self.decoder(
-            feature_identify, feature_motion, seq_len=n)
+            feature_identify, feature_motion, z, seq_len=n)
 
-        recon_feature_identify, recon_feature_motion, _ = self.encoder(
+        (recon_feature_identify, recon_feature_motion), (mu, logvar), _ = self.encoder(
             recon_seq)
 
         loss_cls_identify = self.circle_loss_identify(
@@ -352,7 +379,6 @@ class MaskGait(pl.LightningModule):
         else:
             self.logger.experiment.add_embedding(
                 feature_motion, metadata=motion_label, global_step=self.global_step)
-        return loss
 
     def configure_optimizers(self):
         opt_ae = torch.optim.Adam(
