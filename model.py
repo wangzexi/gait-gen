@@ -255,15 +255,22 @@ class MaskGait(pl.LightningModule):
 
         self.pos_embedding = get_sinusoid_encoding_table(128, 93)
 
+    def configure_optimizers(self):
+        opt_ae = torch.optim.Adam(
+            itertools.chain(self.encoder.parameters(),
+                            self.decoder.parameters()),
+            lr=1e-3)
+        opt_decoder = torch.optim.Adam(self.decoder.parameters(), lr=1e-3)
+        return [opt_ae, opt_decoder], []
+
+    def forward(self, input_seq, mask: torch.Tensor = None):
+        (fi, fm), (mu, logvar), embedding = self.encoder(input_seq, mask)
+        return fi, fm
+
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return eps * std + mu
-
-    def forward(self, input_seq, mask: torch.Tensor = None):
-        (fi, fm), (mu, logvar), embedding = self.encoder(input_seq, mask)
-        recon_seq = self.decoder(fi, fm, seq_len=embedding.shape[1])
-        return fi, fm, recon_seq
 
     def training_step(self, batch, batch_idx, optimizer_idx):
         skeleton, sequence, label, motion_label = batch
@@ -380,13 +387,15 @@ class MaskGait(pl.LightningModule):
             self.logger.experiment.add_embedding(
                 feature_motion, metadata=motion_label, global_step=self.global_step)
 
-    def configure_optimizers(self):
-        opt_ae = torch.optim.Adam(
-            itertools.chain(self.encoder.parameters(),
-                            self.decoder.parameters()),
-            lr=1e-3)
-        opt_decoder = torch.optim.Adam(self.decoder.parameters(), lr=1e-3)
-        return [opt_ae, opt_decoder], []
+    def test_step(self, batch, batch_idx):
+        skeleton, sequence, label, motion_label = batch
+
+        input_seq = sequence[:, :, :]
+        target_seq = sequence[:, :, :]
+
+        b, n, c = input_seq.shape
+
+        print('测试代码实现在此处')
 
 
 if __name__ == '__main__':
