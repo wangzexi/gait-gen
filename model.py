@@ -195,21 +195,20 @@ class Decoder(pl.LightningModule):
 
         self.out_proj = nn.Linear(dim, patch_dim)
 
-    def forward(self, feature_identify, feature_motion, z, seq_len: int) -> torch.Tensor:
-        # feature_identify.shape: [b, feature_identify_dim]
+    def forward(self, feature_identify_z, feature_motion, seq_len: int) -> torch.Tensor:
+        # feature_identify_z.shape: [b, feature_identify_dim]
         # feature_motion.shape: [b, feature_motion_dim]
-        # z.shape: [b, z_dim]
         # seq_len: 生成序列长度
 
         if self.device != self.pos_embedding.device:  # hotfix
             self.pos_embedding = self.pos_embedding.to(self.device)
 
-        b, n = feature_identify.shape[0], seq_len
+        b, n = feature_identify_z.shape[0], seq_len
 
         placeholder = repeat(self.placeholder, '() () d -> b n d', b=b, n=n)
         placeholder += self.pos_embedding[:, 1:(n + 1), :]  # 加位置编码
 
-        feature = torch.cat((z, feature_motion), dim=1)
+        feature = torch.cat((feature_identify_z, feature_motion), dim=1)
         feature = rearrange(self.feature_proj(feature), 'b d -> b 1 d')
 
         x = self.transformer(torch.cat([feature, placeholder], dim=1))
@@ -275,57 +274,122 @@ class MaskGait(pl.LightningModule):
     def training_step(self, batch, batch_idx, optimizer_idx):
         skeleton, sequence, label, motion_label = batch
 
-        input_seq = sequence[:, :, :]
-        target_seq = sequence[:, :, :]
+        if self.global_step % 2 == 0:  # 样本自交训练
 
-        b, n, c = input_seq.shape
+            input_seq = sequence[:, :, :]
+            target_seq = sequence[:, :, :]
 
-        if optimizer_idx == 0:  # 训练编码器
+            b, n, c = input_seq.shape
 
-            mask = gen_mask(n, mask_ratio=0.8, device=self.device)
+            if optimizer_idx == 0:  # 训练编码器
+                mask = gen_mask(n, mask_ratio=0.8, device=self.device)
 
-            (feature_identify, feature_motion), (mu, logvar), embedding = self.encoder(
-                input_seq, mask)
-            z = self.reparameterize(mu, logvar)
-            recon_seq = self.decoder(
-                feature_identify, feature_motion, z, seq_len=n)
+                (feature_identify, feature_motion), (mu, logvar), embedding = self.encoder(
+                    input_seq, mask)
+                z = self.reparameterize(mu, logvar)
+                recon_seq = self.decoder(z, feature_motion, seq_len=n)
 
-            loss_cls_identify = self.circle_loss_identify(
-                *convert_label_to_similarity(feature_identify, label))
-            loss_identify_kld = self.kld_loss(mu, logvar)
+                loss_cls_identify = self.circle_loss_identify(
+                    *convert_label_to_similarity(feature_identify, label))
+                loss_identify_kld = self.kld_loss(mu, logvar)
 
-            loss_cls_motion = self.circle_loss_motion(
-                *convert_label_to_similarity(feature_motion, motion_label))
+                loss_cls_motion = self.circle_loss_motion(
+                    *convert_label_to_similarity(feature_motion, motion_label))
 
-            loss_recon = self.mse_loss(recon_seq, target_seq)
+                loss_recon = self.mse_loss(recon_seq, target_seq)
 
-            loss = loss_cls_identify + loss_identify_kld + loss_cls_motion + loss_recon
+                loss = loss_cls_identify + loss_identify_kld + loss_cls_motion + loss_recon
 
-            self.log_dict({'train/loss_cls_identify': loss_cls_identify,
-                           'train/loss_cls_motion': loss_cls_motion,
-                          'train/loss_recon': loss_recon})
-            return loss
+                self.log_dict({'train/loss_cls_identify': loss_cls_identify,
+                               'train/loss_cls_motion': loss_cls_motion,
+                               'train/loss_recon': loss_recon})
+                return loss
 
-        if optimizer_idx == 1:  # 训练解码器，让生成的序列与原始序列feature相似度更高
-            (feature_identify, feature_motion), (mu, logvar), embedding = self.encoder(
-                input_seq)
-            z = self.reparameterize(mu, logvar)
-            recon_seq = self.decoder(
-                feature_identify, feature_motion, z, seq_len=n)
-            (recon_feature_identify, recon_feature_motion), (mu, logvar), _ = self.encoder(
-                recon_seq)
+            if optimizer_idx == 1:  # 训练解码器，让生成的序列与原始序列feature相似度更高
+                (feature_identify, feature_motion), (mu, logvar), embedding = self.encoder(
+                    input_seq)
+                z = self.reparameterize(mu, logvar)
+                recon_seq = self.decoder(z, feature_motion, seq_len=n)
+                (recon_feature_identify, recon_feature_motion), (mu, logvar), _ = self.encoder(
+                    recon_seq)
 
-            loss_recon_cls_identify = self.circle_loss_identify(
-                *convert_label_to_similarity(torch.cat([feature_identify, recon_feature_identify]), torch.cat([label, label])))
-            loss_recon_cls_motion = self.circle_loss_motion(
-                *convert_label_to_similarity(torch.cat([feature_motion, recon_feature_motion]), torch.cat([motion_label, motion_label])))
+                loss_recon_cls_identify = self.circle_loss_identify(
+                    *convert_label_to_similarity(torch.cat([feature_identify, recon_feature_identify]), torch.cat([label, label])))
+                loss_recon_cls_motion = self.circle_loss_motion(
+                    *convert_label_to_similarity(torch.cat([feature_motion, recon_feature_motion]), torch.cat([motion_label, motion_label])))
 
-            loss = loss_recon_cls_identify + loss_recon_cls_motion
+                loss = loss_recon_cls_identify + loss_recon_cls_motion
 
-            self.log_dict({'train/loss_recon_cls_identify': loss_recon_cls_identify,
-                           'train/loss_recon_cls_motion': loss_recon_cls_motion})
+                self.log_dict({'train/loss_recon_cls_identify': loss_recon_cls_identify,
+                               'train/loss_recon_cls_motion': loss_recon_cls_motion})
 
-            return loss
+                return loss
+
+        else:  # 样本杂交训练
+            b, n, c = sequence.shape
+
+            idx = torch.randperm(b)
+
+            a_input_seq = sequence[:, :, :]
+            a_target_seq = sequence[:, :, :]
+            a_label = label[:]
+            a_motion_label = motion_label[:]
+
+            b_input_seq = sequence[idx, :, :]
+            b_target_seq = sequence[idx, :, :]
+            b_label = label[idx]
+            b_motion_label = motion_label[idx]
+
+            if optimizer_idx == 0:  # 训练编码器
+                mask = gen_mask(n, mask_ratio=0.8, device=self.device)
+
+                (a_feature_identify, a_feature_motion), (a_mu, a_logvar), a_embedding = self.encoder(
+                    a_input_seq, mask)
+                (b_feature_identify, b_feature_motion), (b_mu, b_logvar), b_embedding = self.encoder(
+                    b_input_seq, mask)
+
+                a_z = self.reparameterize(a_mu, a_logvar)
+                recon_seq = self.decoder(a_z, b_feature_motion, seq_len=n)
+
+                loss_cls_identify = self.circle_loss_identify(
+                    *convert_label_to_similarity(a_feature_identify, a_label))
+                loss_identify_kld = self.kld_loss(a_mu, b_logvar)
+
+                loss_cls_motion = self.circle_loss_motion(
+                    *convert_label_to_similarity(b_feature_motion, b_motion_label))
+
+                loss_recon = self.mse_loss(recon_seq, b_target_seq)  # 运动来自b
+
+                loss = loss_cls_identify + loss_identify_kld + loss_cls_motion + 0.5*loss_recon
+
+                self.log_dict({'train/loss_cls_identify': loss_cls_identify,
+                               'train/loss_cls_motion': loss_cls_motion,
+                               'train/loss_recon': loss_recon})
+                return loss
+
+            if optimizer_idx == 1:  # 训练解码器，让生成的序列与原始序列feature相似度更高
+                (a_feature_identify, a_feature_motion), (a_mu, a_logvar), a_embedding = self.encoder(
+                    a_input_seq)
+                (b_feature_identify, b_feature_motion), (b_mu, b_logvar), b_embedding = self.encoder(
+                    b_input_seq)
+
+                a_z = self.reparameterize(a_mu, a_logvar)
+                recon_seq = self.decoder(a_z, b_feature_motion, seq_len=n)
+
+                (recon_feature_identify, recon_feature_motion), (_, _), _ = self.encoder(
+                    recon_seq)
+
+                loss_recon_cls_identify = self.circle_loss_identify(
+                    *convert_label_to_similarity(torch.cat([a_feature_identify, recon_feature_identify]), torch.cat([a_label, a_label])))
+                loss_recon_cls_motion = self.circle_loss_motion(
+                    *convert_label_to_similarity(torch.cat([b_feature_motion, recon_feature_motion]), torch.cat([b_motion_label, b_motion_label])))
+
+                loss = loss_recon_cls_identify + loss_recon_cls_motion
+
+                self.log_dict({'train/loss_recon_cls_identify': loss_recon_cls_identify,
+                               'train/loss_recon_cls_motion': loss_recon_cls_motion})
+
+                return loss
 
     def validation_step(self, batch, batch_idx):
         skeleton, sequence, label, motion_label = batch
@@ -339,8 +403,7 @@ class MaskGait(pl.LightningModule):
                                              logvar), embedding = self.encoder(input_seq)
         # z = self.reparameterize(mean, logvar)
         z = torch.randn_like(mean)
-        recon_seq = self.decoder(
-            feature_identify, feature_motion, z, seq_len=n)
+        recon_seq = self.decoder(z, feature_motion, seq_len=n)
 
         (recon_feature_identify, recon_feature_motion), (mu, logvar), _ = self.encoder(
             recon_seq)
