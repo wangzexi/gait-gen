@@ -153,12 +153,12 @@ class Encoder(pl.LightningModule):
         b, n, d = x.shape
 
         cls_tokens = repeat(self.cls_token, '() n d -> b n d', b=b)
-        cls_tokens += self.pos_embedding[:, 0:1, :]
+        cls_tokens = cls_tokens + self.pos_embedding[:, 0:1, :]
 
         if mask is not None:
             x_pos_embedding = x_pos_embedding.masked_select(
                 repeat(mask, 'n -> b n d', b=b, d=d)).reshape(b, -1, d)
-        x += x_pos_embedding
+        x = x + x_pos_embedding
 
         x = torch.cat((cls_tokens, x), dim=1)
 
@@ -206,7 +206,8 @@ class Decoder(pl.LightningModule):
         b, n = feature_identify_z.shape[0], seq_len
 
         placeholder = repeat(self.placeholder, '() () d -> b n d', b=b, n=n)
-        placeholder += self.pos_embedding[:, 1:(n + 1), :]  # 加位置编码
+        placeholder = placeholder + \
+            self.pos_embedding[:, 1:(n + 1), :]  # 加位置编码
 
         feature = torch.cat((feature_identify_z, feature_motion), dim=1)
         feature = rearrange(self.feature_proj(feature), 'b d -> b 1 d')
@@ -465,5 +466,5 @@ if __name__ == '__main__':
     model = MaskGait()
 
     x = torch.randn(6, 80, 93)
-    fi, ft, recon = model(x)
-    print(fi.shape, ft.shape, recon.shape)
+    fi, ft = model(x)
+    print(fi.shape, ft.shape)
