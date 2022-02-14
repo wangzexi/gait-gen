@@ -12,6 +12,8 @@ conda activate py39
 conda install pytorch torchvision torchaudio cudatoolkit=11.3 -c pytorch
 
 pip install pytorch-lightning
+pip install einops
+pip install matplotlib
 
 # 训练模型
 python train.py
