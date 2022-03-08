@@ -6,9 +6,9 @@ from dataset import CMU_DataModule
 trainer = pl.Trainer(
     gpus=1,
     logger=pl.loggers.TensorBoardLogger(save_dir='tb_logs', name='MaskGait'),
-    max_epochs=5000,
+    max_epochs=200,
     # log_every_n_steps=50,
-    # val_check_interval=6,
+    val_check_interval=10,
     # limit_val_batches=0.5
 
     callbacks=[pl.callbacks.ModelCheckpoint(
@@ -24,6 +24,11 @@ model = MaskGait()
 data_module = CMU_DataModule(batch_size=16)
 
 trainer.fit(
+    model=model,
+    datamodule=data_module,
+)
+
+trainer.test(
     model=model,
     datamodule=data_module,
 )

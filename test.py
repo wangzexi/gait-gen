@@ -11,8 +11,9 @@ trainer = pl.Trainer(
     logger=pl.loggers.TensorBoardLogger(save_dir='tb_logs', name='MaskGait')
 )
 
-# model = MaskGait.load_from_checkpoint('pre_training/loss=119.99-epoch=81-step=491.ckpt')
-model = MaskGait()
+model = MaskGait.load_from_checkpoint(
+    'pre_training/loss=41.02-epoch=161-step=1619.ckpt')
+# model = MaskGait()
 data_module = CMU_DataModule(batch_size=100)
 
 # 测试细节请实现在 model.py 中 MaskGait 类的 test_step 函数中

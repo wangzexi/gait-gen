@@ -283,7 +283,8 @@ class MaskGait(pl.LightningModule):
             b, n, c = input_seq.shape
 
             if optimizer_idx == 0:  # 训练编码器
-                mask = gen_mask(n, mask_ratio=0.8, device=self.device)
+                mask_ratio = np.random.rand() * 0.1
+                mask = gen_mask(n, mask_ratio, device=self.device)
 
                 (feature_identify, feature_motion), (mu, logvar), embedding = self.encoder(
                     input_seq, mask)
@@ -299,7 +300,8 @@ class MaskGait(pl.LightningModule):
 
                 loss_recon = self.mse_loss(recon_seq, target_seq)
 
-                loss = loss_cls_identify + loss_identify_kld + loss_cls_motion + loss_recon
+                loss = 0.7*loss_cls_identify + 0.1*loss_identify_kld + \
+                    0.1*loss_cls_motion + 0.1*loss_recon
 
                 self.log_dict({'train/loss_cls_identify': loss_cls_identify,
                                'train/loss_cls_motion': loss_cls_motion,
@@ -319,7 +321,7 @@ class MaskGait(pl.LightningModule):
                 loss_recon_cls_motion = self.circle_loss_motion(
                     *convert_label_to_similarity(torch.cat([feature_motion, recon_feature_motion]), torch.cat([motion_label, motion_label])))
 
-                loss = loss_recon_cls_identify + loss_recon_cls_motion
+                loss = 0.9*loss_recon_cls_identify + 0.1*loss_recon_cls_motion
 
                 self.log_dict({'train/loss_recon_cls_identify': loss_recon_cls_identify,
                                'train/loss_recon_cls_motion': loss_recon_cls_motion})
@@ -342,7 +344,8 @@ class MaskGait(pl.LightningModule):
             b_motion_label = motion_label[idx]
 
             if optimizer_idx == 0:  # 训练编码器
-                mask = gen_mask(n, mask_ratio=0.8, device=self.device)
+                mask_ratio = np.random.rand() * 0.1
+                mask = gen_mask(n, mask_ratio, device=self.device)
 
                 (a_feature_identify, a_feature_motion), (a_mu, a_logvar), a_embedding = self.encoder(
                     a_input_seq, mask)
@@ -353,15 +356,16 @@ class MaskGait(pl.LightningModule):
                 recon_seq = self.decoder(a_z, b_feature_motion, seq_len=n)
 
                 loss_cls_identify = self.circle_loss_identify(
-                    *convert_label_to_similarity(a_feature_identify, a_label))
-                loss_identify_kld = self.kld_loss(a_mu, b_logvar)
+                    *convert_label_to_similarity(torch.cat([a_feature_identify, b_feature_identify]), torch.cat([a_label, b_label])))
+                loss_identify_kld = self.kld_loss(a_mu, a_logvar)
 
                 loss_cls_motion = self.circle_loss_motion(
-                    *convert_label_to_similarity(b_feature_motion, b_motion_label))
+                    *convert_label_to_similarity(torch.cat([b_feature_motion, a_feature_motion]), torch.cat([b_motion_label, a_motion_label])))
 
                 loss_recon = self.mse_loss(recon_seq, b_target_seq)  # 运动来自b
 
-                loss = loss_cls_identify + loss_identify_kld + loss_cls_motion + 0.5*loss_recon
+                loss = 0.7*loss_cls_identify + 0.1*loss_identify_kld + \
+                    0.1*loss_cls_motion + 0.1*loss_recon
 
                 self.log_dict({'train/loss_cls_identify': loss_cls_identify,
                                'train/loss_cls_motion': loss_cls_motion,
@@ -381,11 +385,11 @@ class MaskGait(pl.LightningModule):
                     recon_seq)
 
                 loss_recon_cls_identify = self.circle_loss_identify(
-                    *convert_label_to_similarity(torch.cat([a_feature_identify, recon_feature_identify]), torch.cat([a_label, a_label])))
+                    *convert_label_to_similarity(torch.cat([a_feature_identify, recon_feature_identify, b_feature_identify]), torch.cat([a_label, a_label, b_label])))
                 loss_recon_cls_motion = self.circle_loss_motion(
-                    *convert_label_to_similarity(torch.cat([b_feature_motion, recon_feature_motion]), torch.cat([b_motion_label, b_motion_label])))
+                    *convert_label_to_similarity(torch.cat([b_feature_motion, recon_feature_motion, a_feature_motion]), torch.cat([b_motion_label, b_motion_label, a_motion_label])))
 
-                loss = loss_recon_cls_identify + loss_recon_cls_motion
+                loss = 0.9*loss_recon_cls_identify + 0.1*loss_recon_cls_motion
 
                 self.log_dict({'train/loss_recon_cls_identify': loss_recon_cls_identify,
                                'train/loss_recon_cls_motion': loss_recon_cls_motion})
@@ -395,34 +399,46 @@ class MaskGait(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         skeleton, sequence, label, motion_label = batch
 
-        input_seq = sequence[:, :, :]
-        target_seq = sequence[:, :, :]
+        b, n, c = sequence.shape
 
-        b, n, c = input_seq.shape
+        idx = torch.randperm(b)
 
-        (feature_identify, feature_motion), (mean,
-                                             logvar), embedding = self.encoder(input_seq)
-        # z = self.reparameterize(mean, logvar)
-        z = torch.randn_like(mean)
-        recon_seq = self.decoder(z, feature_motion, seq_len=n)
+        a_input_seq = sequence[:, :, :]
+        a_target_seq = sequence[:, :, :]
+        a_label = label[:]
+        a_motion_label = motion_label[:]
 
-        (recon_feature_identify, recon_feature_motion), (mu, logvar), _ = self.encoder(
+        b_input_seq = sequence[idx, :, :]
+        b_target_seq = sequence[idx, :, :]
+        b_label = label[idx]
+        b_motion_label = motion_label[idx]
+
+        (a_feature_identify, a_feature_motion), (a_mu, a_logvar), a_embedding = self.encoder(
+            a_input_seq)
+        (b_feature_identify, b_feature_motion), (b_mu, b_logvar), b_embedding = self.encoder(
+            b_input_seq)
+
+        a_z = self.reparameterize(a_mu, a_logvar)
+        recon_seq = self.decoder(a_z, b_feature_motion, seq_len=n)  # A的身份、B的动作
+
+        (recon_feature_identify, recon_feature_motion), (_, _), _ = self.encoder(
             recon_seq)
 
+        # 计算loss
         loss_cls_identify = self.circle_loss_identify(
-            *convert_label_to_similarity(feature_identify, label))
+            *convert_label_to_similarity(torch.cat([a_feature_identify, b_feature_identify]), torch.cat([a_label, b_label])))
         loss_cls_motion = self.circle_loss_motion(
-            *convert_label_to_similarity(feature_motion, motion_label))
+            *convert_label_to_similarity(torch.cat([a_feature_motion, b_feature_motion]), torch.cat([a_motion_label, b_motion_label])))
 
-        loss_recon = self.mse_loss(recon_seq, target_seq)
+        loss_recon = self.mse_loss(recon_seq, b_target_seq)  # 运动来自b
 
         loss_recon_cls_identify = self.circle_loss_identify(
-            *convert_label_to_similarity(torch.cat([feature_identify, recon_feature_identify]), torch.cat([label, label])))
+            *convert_label_to_similarity(torch.cat([a_feature_identify, recon_feature_identify, b_feature_identify]), torch.cat([a_label, a_label, b_label])))
         loss_recon_cls_motion = self.circle_loss_motion(
-            *convert_label_to_similarity(torch.cat([feature_motion, recon_feature_motion]), torch.cat([motion_label, motion_label])))
+            *convert_label_to_similarity(torch.cat([b_feature_motion, recon_feature_motion, a_feature_motion]), torch.cat([b_motion_label, b_motion_label, a_motion_label])))
 
-        loss = loss_cls_identify + loss_cls_motion + loss_recon + \
-            loss_recon_cls_identify + loss_recon_cls_motion
+        loss = 0.1*loss_cls_identify + 0.1*loss_cls_motion + 0.1*loss_recon + \
+            0.4*loss_recon_cls_identify + 0.3*loss_recon_cls_motion
 
         self.log_dict({'val/loss_cls_identify': loss_cls_identify,
                        'val/loss_cls_motion': loss_cls_motion,
@@ -444,12 +460,8 @@ class MaskGait(pl.LightningModule):
         save_bvh_to_file(
             'tb_logs/output/recon_{}_{}_{}_{}.bvh'.format(self.current_epoch, np_label, np_motion_label, n), np_skeleton, np_recon_seq, frame_time=0.025)
 
-        if self.global_step % 2 == 0:
-            self.logger.experiment.add_embedding(
-                feature_identify, metadata=label, global_step=self.global_step)
-        else:
-            self.logger.experiment.add_embedding(
-                feature_motion, metadata=motion_label, global_step=self.global_step)
+        self.logger.experiment.add_embedding(
+            recon_feature_identify, metadata=a_label, global_step=self.global_step)
 
     def test_step(self, batch, batch_idx):
         skeleton, sequence, label, motion_label = batch
@@ -458,8 +470,79 @@ class MaskGait(pl.LightningModule):
         target_seq = sequence[:, :, :]
 
         b, n, c = input_seq.shape
+        device = input_seq.device
 
-        print('测试代码实现在此处')
+        (feature_identify, feature_motion), (mean,
+                                             logvar), embedding = self.encoder(input_seq)  # 获得输入序列的特征
+        indices = torch.arange(b, device=device)[
+            motion_label == 0]  # 获得指定类型运动的索引
+
+        all_z = []
+        all_feature_motion = []
+        all_identify_label = []
+
+        temp_feature_motion = feature_motion[indices, :]  # 拿到运动类别0的运动特征向量
+
+        classes_num = 7
+        for i in range(classes_num):
+            temp_z = torch.randn((1, mean.shape[1]), device=device).repeat(
+                temp_feature_motion.shape[0], 1)
+            # 凭空编造一个随机的身份特征向量，大小(1, 64)
+            # 然后复制这个身份特征向量，大小(14, 64)
+            # 即对同一个身份z，分别组合14个运动特征向量，进而生成14个运动序列
+
+            temp_identify_label = torch.tensor(i, device=device).repeat(
+                (temp_feature_motion.shape[0]))  # 为这个假身份编造一个独一无二的身份标签，大小(14,)
+
+            # 压入一组参数
+            all_z.append(temp_z)
+            all_feature_motion.append(temp_feature_motion)
+            all_identify_label.append(temp_identify_label)
+
+        all_z = torch.cat(all_z, dim=0)  # (17*14, 64)
+        all_feature_motion = torch.cat(
+            all_feature_motion, dim=0)  # (17*14, 64)
+        all_identify_label = torch.cat(
+            all_identify_label, dim=0)  # (17*14,)
+
+        # z = self.reparameterize(mean, logvar)  # 从均值向量和方差向量里采样一个身份特征向量z
+
+        recon_seq = self.decoder(
+            all_z, all_feature_motion, seq_len=n)  # 送入解码器，并 指定生成序列长度为n
+
+        (recon_feature_identify, recon_feature_motion), (mu,
+                                                         logvar), embedding = self.encoder(recon_seq)  # 获得重构后的身份特征向量、运动特征向量
+
+        def get_distance(a, b):  # [c] [c]
+            return (a-b).pow(2).sum().sqrt()
+
+        def get_distances(arr):  # [n, c]
+            d = []
+            for i in range(arr.shape[0]):
+                for j in range(arr.shape[0]):
+                    if i == j:
+                        continue
+                    d.append(get_distance(arr[i], arr[j]))
+            return torch.tensor(d)
+
+        intra_class_distance = []  # 类内距
+        inter_class_distance = []  # 类间距
+
+        # 身份向量之间距离计算
+        class_center = []  # 类平均中心
+        for i in range(classes_num):
+            # 选出同类的身份向量
+            feature_identify = recon_feature_identify[all_identify_label == i]
+            intra_class_distance.extend(
+                get_distances(feature_identify))  # 计算类内距们
+
+            class_center.append(torch.mean(feature_identify, dim=0))  # 计算类中心
+
+        intra_class_distance = torch.tensor(intra_class_distance).mean()
+        inter_class_distance = get_distances(
+            torch.stack(class_center)).mean()  # 计算类间距
+
+        print(intra_class_distance, inter_class_distance)
 
 
 if __name__ == '__main__':
