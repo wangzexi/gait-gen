@@ -18,3 +18,7 @@ pip install matplotlib
 # 训练模型
 python train.py
 ```
+
+## 细节
+
+https://zexi.notion.site/818242089dd9404a8d3445309c5d90a1

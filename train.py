@@ -6,7 +6,7 @@ from dataset import CMU_DataModule
 trainer = pl.Trainer(
     gpus=1,
     logger=pl.loggers.TensorBoardLogger(save_dir='tb_logs', name='MaskGait'),
-    max_epochs=200,
+    max_epochs=300,
     # log_every_n_steps=50,
     val_check_interval=10,
     # limit_val_batches=0.5
